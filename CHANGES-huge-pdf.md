@@ -96,3 +96,19 @@ viewer 的 disable* 选项只从 URL hash 通道读取（web/app.js:401-407）�
 | 小文件对照（tracemonkey.pdf，脚本 `verify-menu-small.mjs`） | 菜单/URL 渲染一致 | 14 页、canvas 1019x1319，两路径完全一致 |
 
 **明确不改**：小文件路径、http URL 路径、全局选项；`getData()` 导出整个 5.6GB 仍失败（固有约束），下载按钮有 blob URL 回退（浏览器流式写盘，不经 pdf.js 缓冲）。
+
+## 七、稀疏 `bytes` getter 语义修正（2026-08-04，第三次改动）
+
+**问题**：fork CI 的 Node CLI 单测 5 个 "PDF page editing" spec 失败（`extractPages` 返回 null）。根因：稀疏改造时把 `ChunkedStream.bytes` 改成"未全量加载即抛错"，而 `Stream.prototype.clone()`（PDFEditor 页面复制路径）会读 `this.bytes`；上游旧行为是预分配 buffer、缺失区域补零，从不抛错。
+
+**改动**（`src/core/chunked_stream.js`，仅 bytes getter）：
+
+- 未全量加载时：`bytes` 按需装配整文件视图，缺失块补零（恢复上游旧语义）；
+- 全量加载后：装配一次并缓存（GetData/SaveDocument 路径不变，worker 本就先 `requestAllChunks` 等全量）；
+- 构造仍是 O(1) 稀疏存储，浏览/解析读取路径（`getByte`/`getBytes`/`getByteRange`）一行未动。
+
+**对大文件浏览无影响**：菜单 5.6GB 重测 1.72s 首页 / 0.72s 跳页 / 29MB 堆 / 零错误（抛错版验收已证明浏览路径不访问 `bytes`）。
+
+**验证**：CLI 全套 1498 spec 仅剩 8 个缺下载 PDF 的环境性 404（修复前 5 个 page-editing 失败）；浏览器单测 1544 spec 9 个已知环境性失败（基线）；回归冒烟 14/15（已知损坏样本）；lint 通过。
+
+注意：跑 `gulp generic`/`lib-legacy` 重建后再跑浏览器/CLI 单测必须带 `TESTING=true`（CI 的 `setTestEnv` 就是做这件事），否则版本校验（API null vs Worker 6.3.x）和 assert 行为与 CI 不一致，会出现一批假失败。

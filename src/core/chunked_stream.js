@@ -46,20 +46,21 @@ class ChunkedStream extends Stream {
     );
     // Replace the empty own-property set by the `Stream` constructor with a
     // lazily assembling getter: `bytes` provides a contiguous view of the
-    // entire file, assembled only once the data is fully loaded (e.g. for
-    // the GetData/SaveDocument code-paths). Note that for very large
-    // documents this can exceed the maximum supported ArrayBuffer size --
-    // an inherent limitation of exporting the entire file, unrelated to
-    // regular (incremental) viewing.
+    // entire file, assembled on demand. Missing chunks yield zeros, matching
+    // the old pre-allocated buffer behaviour (callers such as
+    // `Stream.prototype.clone` may read `bytes` while the file is still
+    // loading). The assembled buffer is cached once the data is fully loaded
+    // (e.g. for the GetData/SaveDocument code-paths). Note that for very
+    // large documents this can exceed the maximum supported ArrayBuffer
+    // size -- an inherent limitation of exporting the entire file, unrelated
+    // to regular (incremental) viewing.
     Object.defineProperty(this, "bytes", {
       get: () => {
-        if (!this.isDataLoaded) {
-          throw new Error(
-            "ChunkedStream.bytes - the data is not fully loaded."
-          );
+        if (this.isDataLoaded) {
+          this._fullBytes ??= this._readRange(0, this.end);
+          return this._fullBytes;
         }
-        this._fullBytes ??= this._readRange(0, this.end);
-        return this._fullBytes;
+        return this._readRange(0, this.end);
       },
       configurable: true,
     });
