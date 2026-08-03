@@ -1093,8 +1093,15 @@ async function startBrowser({
 }
 
 async function startBrowsers({ baseUrl, initializeSession, numSessions = 1 }) {
-  // Install the browsers.
-  for (const browser of ["firefox@nightly", "chrome@stable"]) {
+  // Install the browsers (only the ones that will actually be used).
+  const browsersToInstall = [];
+  if (!options.noFirefox) {
+    browsersToInstall.push("firefox@nightly");
+  }
+  if (!options.noChrome) {
+    browsersToInstall.push("chrome@stable");
+  }
+  for (const browser of browsersToInstall) {
     execSync(`npx puppeteer browsers install ${browser}`, { stdio: "inherit" });
   }
 
@@ -1337,7 +1344,9 @@ async function closeSession(browser) {
 
 async function ensurePDFsDownloaded() {
   const manifest = getTestManifest();
-  await downloadManifestFiles(manifest);
+  if (!options.noDownload) {
+    await downloadManifestFiles(manifest);
+  }
   try {
     await verifyManifestFiles(manifest);
   } catch {

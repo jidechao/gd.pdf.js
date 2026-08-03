@@ -4366,11 +4366,7 @@ class PartialEvaluator {
         const stream = toUnicode.stream || toUnicode;
         const uint8array = stream.buffer
           ? new Uint8Array(stream.buffer.buffer, 0, stream.bufferLength)
-          : new Uint8Array(
-              stream.bytes.buffer,
-              stream.start,
-              stream.end - stream.start
-            );
+          : stream.getByteRange(stream.start, stream.end);
         hash.update(uint8array);
       } else if (toUnicode instanceof Name) {
         hash.update(toUnicode.name);

@@ -25,17 +25,116 @@ class ChunkedStream extends Stream {
 
   _loadedChunks = new Set();
 
+  // Sparse per-chunk storage, instead of one contiguous buffer sized to the
+  // entire file: for multi-GB documents such a buffer would exceed the
+  // maximum ArrayBuffer size supported by the JS engine.
+  _chunkMap = new Map();
+
+  _fullBytes = null; // Lazily assembled contiguous buffer, see `bytes` getter.
+
+  // Single-entry cache of the chunk last read by `getByte`.
+  _curChunk = null;
+
+  _curChunkIdx = -1;
+
   constructor(length, chunkSize, manager) {
     super(
-      /* arrayBuffer = */ new Uint8Array(length),
+      /* arrayBuffer = */ new Uint8Array(0),
       /* start = */ 0,
       /* length = */ length,
       /* dict = */ null
     );
+    // Replace the empty own-property set by the `Stream` constructor with a
+    // lazily assembling getter: `bytes` provides a contiguous view of the
+    // entire file, assembled only once the data is fully loaded (e.g. for
+    // the GetData/SaveDocument code-paths). Note that for very large
+    // documents this can exceed the maximum supported ArrayBuffer size --
+    // an inherent limitation of exporting the entire file, unrelated to
+    // regular (incremental) viewing.
+    Object.defineProperty(this, "bytes", {
+      get: () => {
+        if (!this.isDataLoaded) {
+          throw new Error(
+            "ChunkedStream.bytes - the data is not fully loaded."
+          );
+        }
+        this._fullBytes ??= this._readRange(0, this.end);
+        return this._fullBytes;
+      },
+      configurable: true,
+    });
 
     this.chunkSize = chunkSize;
     this.numChunks = Math.ceil(length / chunkSize);
     this.manager = manager;
+  }
+
+  /**
+   * Store received bytes into the sparse per-chunk storage. The `begin`
+   * offset does not need to be chunk-aligned (progressive data can arrive in
+   * arbitrarily sized pieces); chunks are only marked as loaded once they
+   * have been completely filled.
+   */
+  _storeRange(begin, bytes) {
+    const { chunkSize } = this;
+    const end = begin + bytes.byteLength;
+    let bytesOffset = 0;
+
+    while (begin < end) {
+      const chunkIdx = Math.floor(begin / chunkSize);
+      const inChunkOffset = begin - chunkIdx * chunkSize;
+      const n = Math.min(chunkSize - inChunkOffset, end - begin);
+
+      let chunk = this._chunkMap.get(chunkIdx);
+      if (!chunk) {
+        const size = Math.min(chunkSize, this.end - chunkIdx * chunkSize);
+        chunk = new Uint8Array(size);
+        this._chunkMap.set(chunkIdx, chunk);
+      }
+      chunk.set(bytes.subarray(bytesOffset, bytesOffset + n), inChunkOffset);
+
+      if (inChunkOffset + n === chunk.byteLength) {
+        // Since a value can only occur *once* in a `Set`, there's no need to
+        // manually check `Set.prototype.has()` before adding the value here.
+        this._loadedChunks.add(chunkIdx);
+      }
+      begin += n;
+      bytesOffset += n;
+    }
+  }
+
+  /**
+   * Read a (loaded) range of bytes. Returns a `subarray` view when the range
+   * lies within a single chunk, and a newly allocated copy otherwise. Missing
+   * chunks yield zeros, matching the old zero-filled buffer behaviour.
+   */
+  _readRange(begin, end) {
+    if (begin >= end) {
+      return new Uint8Array(0);
+    }
+    const { chunkSize } = this;
+    const beginChunk = Math.floor(begin / chunkSize);
+    const endChunk = Math.floor((end - 1) / chunkSize);
+
+    if (beginChunk === endChunk) {
+      const chunk = this._chunkMap.get(beginChunk);
+      const offset = begin - beginChunk * chunkSize;
+      return chunk
+        ? chunk.subarray(offset, offset + (end - begin))
+        : new Uint8Array(end - begin);
+    }
+    const out = new Uint8Array(end - begin);
+    for (let chunkIdx = beginChunk; chunkIdx <= endChunk; chunkIdx++) {
+      const chunk = this._chunkMap.get(chunkIdx);
+      if (!chunk) {
+        continue;
+      }
+      const chunkStart = chunkIdx * chunkSize;
+      const from = Math.max(begin - chunkStart, 0);
+      const to = Math.min(end - chunkStart, chunk.byteLength);
+      out.set(chunk.subarray(from, to), chunkStart + from - begin);
+    }
+    return out;
   }
 
   // If a particular stream does not implement one or more of these methods,
@@ -67,7 +166,7 @@ class ChunkedStream extends Stream {
     // Using `this.length` is inaccurate here since `this.start` can be moved
     // (see the `moveStart` method).
     const end = begin + chunk.byteLength;
-    if (end % chunkSize !== 0 && end !== this.bytes.length) {
+    if (end % chunkSize !== 0 && end !== this.end) {
       throw new Error(`Bad end offset: ${end}`);
     }
 
@@ -77,20 +176,11 @@ class ChunkedStream extends Stream {
         "onReceiveData - expected an ArrayBuffer."
       );
     }
-    this.bytes.set(new Uint8Array(chunk), begin);
-    const beginChunk = Math.floor(begin / chunkSize);
-    const endChunk = Math.floor((end - 1) / chunkSize) + 1;
-
-    for (let curChunk = beginChunk; curChunk < endChunk; ++curChunk) {
-      // Since a value can only occur *once* in a `Set`, there's no need to
-      // manually check `Set.prototype.has()` before adding the value here.
-      this._loadedChunks.add(curChunk);
-    }
+    this._storeRange(begin, new Uint8Array(chunk));
   }
 
   onReceiveProgressiveData(data) {
     let position = this.progressiveDataLength;
-    const beginChunk = Math.floor(position / this.chunkSize);
 
     if (typeof PDFJSDev === "undefined" || PDFJSDev.test("TESTING")) {
       assert(
@@ -98,19 +188,9 @@ class ChunkedStream extends Stream {
         "onReceiveProgressiveData - expected an ArrayBuffer."
       );
     }
-    this.bytes.set(new Uint8Array(data), position);
+    this._storeRange(position, new Uint8Array(data));
     position += data.byteLength;
     this.progressiveDataLength = position;
-    const endChunk =
-      position >= this.end
-        ? this.numChunks
-        : Math.floor(position / this.chunkSize);
-
-    for (let curChunk = beginChunk; curChunk < endChunk; ++curChunk) {
-      // Since a value can only occur *once* in a `Set`, there's no need to
-      // manually check `Set.prototype.has()` before adding the value here.
-      this._loadedChunks.add(curChunk);
-    }
   }
 
   ensureByte(pos) {
@@ -178,7 +258,17 @@ class ChunkedStream extends Stream {
     if (pos >= this.progressiveDataLength) {
       this.ensureByte(pos);
     }
-    return this.bytes[this.pos++];
+    this.pos = pos + 1;
+
+    const chunkIdx = Math.floor(pos / this.chunkSize);
+    if (chunkIdx !== this._curChunkIdx) {
+      this._curChunk = this._chunkMap.get(chunkIdx);
+      this._curChunkIdx = chunkIdx;
+    }
+    // Once `ensureByte` succeeded the chunk is guaranteed to exist.
+    return this._curChunk
+      ? this._curChunk[pos - chunkIdx * this.chunkSize]
+      : -1;
   }
 
   getBytes(length) {
@@ -189,7 +279,7 @@ class ChunkedStream extends Stream {
       this.ensureRange(pos, endPos);
     }
     this.pos = endPos;
-    return this.bytes.subarray(pos, endPos);
+    return this._readRange(pos, endPos);
   }
 
   getByteRange(begin, end) {
@@ -202,7 +292,7 @@ class ChunkedStream extends Stream {
     if (end > this.progressiveDataLength) {
       this.ensureRange(begin, end);
     }
-    return this.bytes.subarray(begin, end);
+    return this._readRange(begin, end);
   }
 
   makeSubStream(start, length, dict = null) {
