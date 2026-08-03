@@ -47,7 +47,15 @@ export default [
       "web/locale/",
       "web/wasm/",
       "**/*~/",
-      ".{claude,codex,cursor}/",
+      ".{claude,codex,cursor,omc}/",
+      // Ad-hoc local verification/repair tooling, not shipped with the viewer.
+      "verify-*.mjs",
+      "repair-*.mjs",
+      "repro-*.mjs",
+      "debug-*.mjs",
+      "regression-smoke.mjs",
+      "control-test.mjs",
+      "test-sparse-chunked.mjs",
     ],
   },
 
