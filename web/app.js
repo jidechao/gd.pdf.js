@@ -68,6 +68,7 @@ import {
 import { LinkTarget, PDFLinkService } from "./pdf_link_service.js";
 import { AltTextManager } from "web-alt_text_manager";
 import { AnnotationEditorParams } from "web-annotation_editor_params";
+import { BlobRangeTransport } from "./blob_range_transport.js";
 import { CaretBrowsingMode } from "./caret_browsing.js";
 import { CommentManager } from "./comment_manager.js";
 import { DownloadManager } from "web-download_manager";
@@ -2690,12 +2691,29 @@ if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
   };
 
   // eslint-disable-next-line no-var
-  var onFileInputChange = function (evt) {
+  var onFileInputChange = async function (evt) {
     if (this.pdfViewer?.isInPresentationMode) {
       return; // Opening a new PDF file isn't supported in Presentation Mode.
     }
     const file = evt.fileInput.files[0];
 
+    if (file.size > 32 * 1024 * 1024) {
+      // Huge local files: use on-demand range reads directly from the Blob,
+      // instead of downloading the entire file through the blob:-URL path.
+      const CHUNK = 65536;
+      const initialData = new Uint8Array(
+        await file.slice(0, CHUNK).arrayBuffer()
+      );
+      this.open({
+        url: URL.createObjectURL(file), // Used for the title/download fallback.
+        originalUrl: encodeURIComponent(file.name),
+        range: new BlobRangeTransport(file, file.size, initialData),
+        rangeChunkSize: CHUNK,
+        disableStream: true,
+        disableAutoFetch: true,
+      });
+      return;
+    }
     this.open({
       url: URL.createObjectURL(file),
       originalUrl: encodeURIComponent(file.name),

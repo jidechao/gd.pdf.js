@@ -1102,12 +1102,28 @@ async function startBrowsers({ baseUrl, initializeSession, numSessions = 1 }) {
     browsersToInstall.push("chrome@stable");
   }
   for (const browser of browsersToInstall) {
-    execSync(`npx puppeteer browsers install ${browser}`, { stdio: "inherit" });
+    try {
+      execSync(`npx puppeteer browsers install ${browser}`, {
+        stdio: "inherit",
+      });
+    } catch {
+      // Resolving `chrome@stable` requires network access; fall back to
+      // whatever browser revision is already in Puppeteer's cache.
+      console.warn(
+        `Failed to install ${browser}; falling back to the cached browser.`
+      );
+    }
   }
 
   // Remove old browser revisions from Puppeteer's cache. The commands above can
   // download new browser revisions, so this prevents the disk from filling up.
-  await puppeteer.trimCache();
+  try {
+    await puppeteer.trimCache();
+  } catch {
+    // `trimCache` may require network access; keeping stale browser
+    // revisions in the cache is harmless.
+    console.warn("Failed to trim Puppeteer's browser cache; continuing.");
+  }
 
   const browserNames = ["firefox", "chrome"];
   if (options.noChrome) {
