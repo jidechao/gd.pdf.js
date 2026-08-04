@@ -59,6 +59,10 @@ import {
   version,
 } from "pdfjs-lib";
 import { AppOptions, OptionKind } from "./app_options.js";
+import {
+  BlobRangeTransport,
+  HybridRangeTransport,
+} from "./blob_range_transport.js";
 import { EventBus, FirefoxEventBus } from "./event_utils.js";
 import { ExternalServices, initCom, MLManager } from "web-external_services";
 import {
@@ -66,9 +70,13 @@ import {
   NewAltTextManager,
 } from "web-new_alt_text_manager";
 import { LinkTarget, PDFLinkService } from "./pdf_link_service.js";
+import {
+  makeUrlRangeReader,
+  probeXref,
+  rebuildXrefSection,
+} from "./pdf_xref_repair.js";
 import { AltTextManager } from "web-alt_text_manager";
 import { AnnotationEditorParams } from "web-annotation_editor_params";
-import { BlobRangeTransport } from "./blob_range_transport.js";
 import { CaretBrowsingMode } from "./caret_browsing.js";
 import { CommentManager } from "./comment_manager.js";
 import { DownloadManager } from "web-download_manager";
@@ -1305,6 +1313,33 @@ const PDFViewerApplication = {
   },
 
   /**
+   * Probe a document's xref and, when it is broken, rebuild a replacement
+   * xref section (to be appended to the original bytes by the caller).
+   * @param {function(number, number): Promise<Uint8Array>} readRange
+   * @param {number} size
+   * @returns {Promise<Uint8Array|null>} The rebuilt xref section, or null
+   *   when the document is fine or a rebuild is not possible/safe.
+   */
+  async _tryRepairBrokenXref(readRange, size) {
+    const probe = await probeXref(readRange, size);
+    if (probe.status !== "broken") {
+      return null;
+    }
+    console.warn(`The PDF xref is broken (${probe.reason}); rebuilding it...`);
+    const bar = this.loadingBar;
+    bar?.show();
+    try {
+      return await rebuildXrefSection(readRange, size, probe, (done, total) => {
+        if (bar) {
+          bar.percent = Math.round((done / total) * 100);
+        }
+      });
+    } finally {
+      bar?.hide();
+    }
+  },
+
+  /**
    * Opens a new PDF document.
    * @param {Object} args - Accepts any/all of the properties from
    *   {@link DocumentInitParameters}, and also a `originalUrl` string.
@@ -1333,11 +1368,66 @@ const PDFViewerApplication = {
       );
     }
 
+    let docArgs = args;
+    let absoluteHttpUrl = null;
+    if (
+      (typeof PDFJSDev === "undefined" || !PDFJSDev.test("MOZCENTRAL")) &&
+      args.url &&
+      !args.range &&
+      !args.data
+    ) {
+      try {
+        const url = new URL(args.url, window.location.href);
+        if (url.protocol === "http:" || url.protocol === "https:") {
+          absoluteHttpUrl = url.href;
+        }
+      } catch {
+        // Not an absolute URL we can probe; ignore.
+      }
+    }
+    if (absoluteHttpUrl) {
+      // For http(s) documents, cheaply probe the xref first; when it is
+      // broken, rebuild it and serve the appendix past the end of the remote
+      // document through a hybrid range transport (avoids downloading the
+      // entire document just to repair the index).
+      try {
+        const reader = makeUrlRangeReader(absoluteHttpUrl);
+        const remoteSize = await reader.size();
+        const section = await this._tryRepairBrokenXref(
+          reader.readRange,
+          remoteSize
+        );
+        if (section) {
+          const CHUNK = 65536;
+          const initialData = await reader.readRange(
+            0,
+            Math.min(CHUNK, remoteSize)
+          );
+          docArgs = {
+            ...args,
+            range: new HybridRangeTransport(
+              reader.readRange,
+              remoteSize,
+              section,
+              initialData
+            ),
+            rangeChunkSize: CHUNK,
+            disableStream: true,
+            disableAutoFetch: true,
+          };
+        }
+      } catch (ex) {
+        console.warn(
+          `Skipping xref auto-repair for ${args.url}: ${ex.message}`
+        );
+      }
+    }
+
     // Set the necessary API parameters, using all the available options.
     const apiParams = AppOptions.getAll(OptionKind.API);
     const loadingTask = getDocument({
       ...apiParams,
-      ...args,
+      ...docArgs,
     });
     this.pdfLoadingTask = loadingTask;
 
@@ -2700,14 +2790,30 @@ if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
     if (file.size > 32 * 1024 * 1024) {
       // Huge local files: use on-demand range reads directly from the Blob,
       // instead of downloading the entire file through the blob:-URL path.
+      let blob = file;
+      try {
+        // When the file's xref is broken (some merge tools produce those),
+        // rebuild it and virtually append the new section -- Blob
+        // concatenation does not copy the underlying data.
+        const readRange = async (begin, end) =>
+          new Uint8Array(await file.slice(begin, end).arrayBuffer());
+        const section = await this._tryRepairBrokenXref(readRange, file.size);
+        if (section) {
+          blob = new Blob([file, section]);
+        }
+      } catch (ex) {
+        console.error(
+          `xref auto-repair failed, opening the original file: ${ex.message}`
+        );
+      }
       const CHUNK = 65536;
       const initialData = new Uint8Array(
-        await file.slice(0, CHUNK).arrayBuffer()
+        await blob.slice(0, CHUNK).arrayBuffer()
       );
       this.open({
-        url: URL.createObjectURL(file), // Used for the title/download fallback.
+        url: URL.createObjectURL(blob), // Used for the title/download fallback.
         originalUrl: encodeURIComponent(file.name),
-        range: new BlobRangeTransport(file, file.size, initialData),
+        range: new BlobRangeTransport(blob, blob.size, initialData),
         rangeChunkSize: CHUNK,
         disableStream: true,
         disableAutoFetch: true,

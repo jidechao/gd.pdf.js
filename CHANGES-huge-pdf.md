@@ -112,3 +112,36 @@ viewer 的 disable* 选项只从 URL hash 通道读取（web/app.js:401-407）�
 **验证**：CLI 全套 1498 spec 仅剩 8 个缺下载 PDF 的环境性 404（修复前 5 个 page-editing 失败）；浏览器单测 1544 spec 9 个已知环境性失败（基线）；回归冒烟 14/15（已知损坏样本）；lint 通过。
 
 注意：跑 `gulp generic`/`lib-legacy` 重建后再跑浏览器/CLI 单测必须带 `TESTING=true`（CI 的 `setTestEnv` 就是做这件事），否则版本校验（API null vs Worker 6.3.x）和 assert 行为与 CI 不一致，会出现一批假失败。
+
+## 八、打开时自动检测并修复损坏 xref（2026-08-04，第四次改动）
+
+**背景**：`PDF合并5G.pdf` 被回滚到损坏状态后菜单/URL 再次打不开——pdf.js 内建恢复（`XRef.indexObjects`）需扫描整个文件，对超大文件等于卡死。WPS 能开是因为它静默重建索引。本次把同等能力做进 viewer。
+
+**行为**：每次打开 PDF 时先廉价检测 xref（完好文件毫秒级放行）；损坏则自动全量扫描对象头、重建 xref 段并"虚拟追加"（原字节不动），然后正常打开。小文件（≤32MB）走原路径，由 pdf.js 内建恢复兜底。
+
+**改动**（3 个文件）：
+
+1. **新增 `web/pdf_xref_repair.js`**（纯函数，无 pdfjs-lib 依赖，可 Node 直接单测）：
+   - `probeXref(readRange, size)`：读文件尾 startxref → 解析 xref 表/trailer → 抽查 /Root 及若干条目偏移处是否以匹配的 `N G obj` 开头。返回 ok / broken / unknown（非 PDF、无法解析等一律 unknown=放行）；
+   - `rebuildXrefSection(readRange, size, probe, onProgress)`：128MB 分块顺序扫描定位全部对象头（行首+内容起始符校验防误报），生成新 xref 段（trailer 的 /Root /Info /ID /Encrypt 从旧 trailer 解析、/Prev 指回旧 startxref、重复对象号取偏移最大者=增量更新语义）。发现 /ObjStm（对象流）或找不到 Root 时返回 null 回退；
+   - `makeUrlRangeReader(url)`：HTTP Range 读取器（不支持 Range 的服务器抛错→跳过修复走原路径）。
+2. **`web/blob_range_transport.js`** 新增 `HybridRangeTransport`：offset < 原文件大小时走 HTTP Range 请求，超出部分从内存中的修复段读取——远程文件修复无需整文件下载进内存。
+3. **`web/app.js`**：
+   - `_tryRepairBrokenXref(readRange, size)`：检测+重建，扫描期间用 loadingBar 显示进度；
+   - `onFileInputChange` 大文件分支：修复后 `new Blob([file, section])` 零拷贝拼接，再走原有 BlobRangeTransport；
+   - `open()` 增加 http(s) 分支（`args.url` 用 `new URL(args.url, location.href)` 解析成绝对地址——`?file=` 传入的是相对路径，直接正则匹配会漏）：损坏时换用 HybridRangeTransport。
+
+**验收结果**（PDF合并5G-broken.pdf = 截断掉修复段的损坏副本）：
+
+| 场景 | 结果 |
+|---|---|
+| 菜单打开损坏 5.6GB | 自动修复，**39.2s** 打开（含 6GB 扫描），跳页 0.47s，堆 28MB，零错误 |
+| URL 打开损坏 5.6GB | 自动修复，**72.9s** 打开（HTTP 吞吐瓶颈），跳页 0.75s，堆 17MB，零错误 |
+| 菜单打开完好 5.6GB | 检测毫秒级放行，行为与之前一致 |
+| 小文件菜单/URL 对照 | 渲染完全一致 |
+| Node 单测（test-xref-repair.mjs） | 好文件 ok、坏文件 broken、真实损坏模式（条目偏移错）broken、修复后再判 ok、ObjStm 回退、startxref 拼接点正确——9 项全过 |
+| 浏览器单测 1544 spec / 回归冒烟 15 PDF | 基线（9 个环境性失败 / 1 个上游固有损坏样本） |
+
+**验证脚本**：`verify-menu-repair.mjs`（菜单坏文件）、`verify-url-repair.mjs`（URL 坏文件）、`test-xref-repair.mjs`（模块单测）。
+
+**已知边界**：发现对象流（/ObjStm）不修复（回退内建恢复）；DocMDP 签名追加段后失效（与 WPS 修复同类）；URL 修复耗时取决于网络/服务器吞吐（6GB 全量扫描不可避免）。

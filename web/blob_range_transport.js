@@ -64,4 +64,69 @@ class BlobRangeTransport extends PDFDataRangeTransport {
   }
 }
 
-export { BlobRangeTransport };
+/**
+ * A `PDFDataRangeTransport` that serves range requests from a remote URL
+ * (via HTTP Range requests) for the original document bytes, and from an
+ * in-memory appendix (a rebuilt xref section) for offsets past the end of
+ * the original document. Used to open a remote PDF whose xref is broken
+ * without having to download the entire document into memory.
+ */
+class HybridRangeTransport extends PDFDataRangeTransport {
+  #aborted = false;
+
+  /**
+   * @param {function(number, number): Promise<Uint8Array>} readRange
+   *   Reads [begin, end) of the original remote document.
+   * @param {number} remoteSize - Size of the original remote document.
+   * @param {Uint8Array} appendix - Bytes appended past `remoteSize`.
+   * @param {Uint8Array|null} initialData
+   */
+  constructor(readRange, remoteSize, appendix, initialData) {
+    super(remoteSize + appendix.length, initialData);
+    this._readRange = readRange;
+    this._remoteSize = remoteSize;
+    this._appendix = appendix;
+  }
+
+  /**
+   * @param {number} begin
+   * @param {number} end
+   */
+  requestDataRange(begin, end) {
+    (async () => {
+      if (end <= this._remoteSize) {
+        return this._readRange(begin, end);
+      }
+      if (begin >= this._remoteSize) {
+        return this._appendix.subarray(
+          begin - this._remoteSize,
+          end - this._remoteSize
+        );
+      }
+      const head = await this._readRange(begin, this._remoteSize);
+      const out = new Uint8Array(end - begin);
+      out.set(head, 0);
+      out.set(this._appendix.subarray(0, end - this._remoteSize), head.length);
+      return out;
+    })().then(
+      bytes => {
+        if (!this.#aborted) {
+          this.onDataRange(begin, bytes);
+        }
+      },
+      reason => {
+        if (this.#aborted) {
+          return;
+        }
+        console.error(`HybridRangeTransport.requestDataRange: ${reason}`);
+        this.abort();
+      }
+    );
+  }
+
+  abort() {
+    this.#aborted = true;
+  }
+}
+
+export { BlobRangeTransport, HybridRangeTransport };

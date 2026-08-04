@@ -56,6 +56,7 @@ export default [
       "regression-smoke.mjs",
       "control-test.mjs",
       "test-sparse-chunked.mjs",
+      "test-xref-repair.mjs",
     ],
   },
 
